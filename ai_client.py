@@ -58,11 +58,15 @@ def resolve_connection_config() -> AIConnectionConfig:
     return AIConnectionConfig(None, base_url, "直连")
 
 
-def create_openai_client(api_key: str, client_class: type[OpenAI] = OpenAI) -> OpenAI:
+def create_openai_client(
+    api_key: str,
+    client_class: type[OpenAI] = OpenAI,
+    timeout_seconds: float = 90.0,
+) -> OpenAI:
     config = resolve_connection_config()
     kwargs: dict[str, object] = {
         "api_key": api_key,
-        "timeout": 90.0,
+        "timeout": timeout_seconds,
         "max_retries": 3,
     }
     if config.base_url:

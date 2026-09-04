@@ -6,4 +6,5 @@ __pycache__/
 data/covers.db
 data/images/*
 !data/images/.gitkeep
-
+data/generated/*
+!data/generated/.gitkeep

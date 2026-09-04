@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import html
 import json
 import os
 import sqlite3
@@ -19,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from cover_renderer import compose_cover
 from ai_client import create_openai_client, friendly_openai_error
 from database import COVER_CATEGORIES, INITIAL_HOOK_TYPES, initialize_database
+from direct_poster import generate_ai_base, render_poster
 from grid_component import GridItem, create_cover_thumbnail, render_image_grid
 from ideas import mark_idea_published, render_ideas_page
 from mobile_access import render_mobile_access
@@ -30,6 +32,7 @@ from ui_styles import apply_app_styles
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 IMAGE_DIR = DATA_DIR / "images"
+GENERATED_DIR = DATA_DIR / "generated"
 DB_PATH = DATA_DIR / "covers.db"
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 
@@ -185,7 +188,28 @@ GENERATION_PROMPT_TEMPLATE = """
 
 def ensure_storage() -> None:
     IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+    GENERATED_DIR.mkdir(parents=True, exist_ok=True)
     initialize_database(DB_PATH)
+
+
+def save_generated_image(image_bytes: bytes, title: str, prefix: str = "poster") -> Path:
+    safe_title = "".join(c for c in title.strip() if c not in '\\/:*?\"<>|')[:36] or "untitled"
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    digest = hashlib.sha256(image_bytes).hexdigest()[:8]
+    path = GENERATED_DIR / f"{prefix}-{timestamp}-{safe_title}-{digest}.png"
+    path.write_bytes(image_bytes)
+    return path
+
+
+def render_long_press_image(image_bytes: bytes, alt: str = "生成海报") -> None:
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    safe_alt = html.escape(alt, quote=True)
+    st.markdown(
+        f'<div class="long-press-image"><img src="data:image/png;base64,{encoded}" '
+        f'alt="{safe_alt}" draggable="false"></div>',
+        unsafe_allow_html=True,
+    )
+    st.caption("手机端可长按图片，选择“保存图片”或“添加到照片”。")
 
 
 def get_api_key() -> str | None:
@@ -561,6 +585,7 @@ def render_add_template_dialog() -> None:
                 st.session_state["generation_result"] = None
                 st.session_state["generation_input"] = None
                 st.session_state["cover_previews"] = {}
+                st.session_state["cover_preview_paths"] = {}
                 st.toast("新对标封面已加入风格库", icon=":material/check_circle:")
                 st.rerun()
             except ValidationError as exc:
@@ -792,6 +817,15 @@ def render_suggestion_cards(result: GenerationResult) -> None:
             except Exception as exc:
                 st.warning(f"方案 {index + 1} 预览生成失败：{exc}")
                 continue
+        st.session_state.setdefault("cover_preview_paths", {})
+        if index not in st.session_state["cover_preview_paths"]:
+            st.session_state["cover_preview_paths"][index] = str(
+                save_generated_image(
+                    st.session_state["cover_previews"][index],
+                    suggestion.title,
+                    prefix=f"suggestion-{index + 1}",
+                )
+            )
         items.append(
             GridItem(
                 item_id=str(index),
@@ -808,7 +842,7 @@ def render_suggestion_cards(result: GenerationResult) -> None:
         preview_bytes = st.session_state["cover_previews"][index]
         image_col, detail_col = st.columns([1, 1.1], gap="large")
         with image_col:
-            st.image(preview_bytes, width="stretch")
+            render_long_press_image(preview_bytes, suggestion.title)
         with detail_col:
             st.markdown(f":violet-badge[{suggestion.hook_type}]")
             st.markdown(f"**版式：** {suggestion.layout_type}")
@@ -836,6 +870,7 @@ def render_suggestion_cards(result: GenerationResult) -> None:
                 key=f"download_preview_{index}",
                 icon=":material/download:",
                 width="stretch",
+                on_click="ignore",
             )
 
     st.caption("点击任意方案缩略图，查看完整排版建议并下载")
@@ -895,6 +930,7 @@ def render_template_gallery(samples: list[sqlite3.Row]) -> None:
                     st.session_state["generation_result"] = None
                     st.session_state["generation_input"] = None
                     st.session_state["cover_previews"] = {}
+                    st.session_state["cover_preview_paths"] = {}
                     st.rerun()
 
 
@@ -909,6 +945,7 @@ def render_generation_page() -> None:
         st.session_state["generation_result"] = None
         st.session_state["generation_input"] = None
         st.session_state["cover_previews"] = {}
+        st.session_state["cover_preview_paths"] = {}
 
     header_col, add_col = st.columns([4, 1], vertical_alignment="center")
     with header_col:
@@ -1006,6 +1043,9 @@ def render_generation_page() -> None:
                 height=128,
                 key="generation_topic",
             )
+            poster_title = st.text_input("海报主标题", value=topic[:40], key="poster_title")
+            poster_subtitle = st.text_input("副标题（可选）", key="poster_subtitle")
+            poster_badge = st.text_input("角标（可选）", placeholder="例如：第40天", key="poster_badge")
             hook_names = [row["name"] for row in load_category_types("hook_types")]
             hook_options = ["自动匹配", *hook_names]
             current_hook = st.session_state.get("generation_hook_type", "自动匹配")
@@ -1028,6 +1068,67 @@ def render_generation_page() -> None:
             width="stretch",
             disabled=not recent_samples,
         )
+        poster_clicked = st.button(
+            "直接生成海报",
+            type="primary",
+            icon=":material/image:",
+            width="stretch",
+        )
+
+    if poster_clicked:
+        if uploaded_photo is None:
+            st.error("请先上传本次使用的人物照片。")
+        elif not poster_title.strip():
+            st.error("请填写海报主标题。")
+        elif not (api_key := get_api_key()):
+            st.error("没有找到 OPENAI_API_KEY，请先配置 API Key。")
+        else:
+            try:
+                with st.spinner("正在匹配人物、构图、调色和文字排版，约需几十秒……"):
+                    try:
+                        ai_base = generate_ai_base(
+                            photo_bytes=uploaded_photo.getvalue(),
+                            template_bytes=template_image_path.read_bytes(), api_key=api_key,
+                            layout_type=selected_template["layout_type"],
+                            color_style=selected_template["color_style"],
+                            font_style=selected_template["font_style"],
+                        )
+                        st.session_state["direct_poster_note"] = "人物、背景和设计氛围已由 AI 匹配对标模板。"
+                    except Exception as image_exc:
+                        ai_base = uploaded_photo.getvalue()
+                        st.session_state["direct_poster_note"] = (
+                            "图像重绘暂不可用，已自动改用原照片完成排版。"
+                            + friendly_openai_error(image_exc)
+                        )
+                    st.session_state["direct_poster"] = render_poster(
+                        base_bytes=ai_base, title=poster_title.strip(),
+                        subtitle=poster_subtitle.strip(), badge=poster_badge.strip(),
+                        layout_type=selected_template["layout_type"],
+                        color_style=selected_template["color_style"],
+                        font_style=selected_template["font_style"],
+                        template_bytes=template_image_path.read_bytes(),
+                    )
+                    st.session_state["direct_poster_path"] = str(
+                        save_generated_image(
+                            st.session_state["direct_poster"], poster_title, prefix="poster"
+                        )
+                    )
+                st.rerun()
+            except Exception as exc:
+                st.error(friendly_openai_error(exc))
+
+    if direct_poster := st.session_state.get("direct_poster"):
+        with st.container(border=True):
+            st.subheader("海报初稿", icon=":material/image:")
+            st.caption(st.session_state.get("direct_poster_note", "已生成可下载海报。"))
+            if saved_path := st.session_state.get("direct_poster_path"):
+                st.success(f"已自动保存到电脑：{saved_path}", icon=":material/save:")
+            render_long_press_image(direct_poster, poster_title)
+            st.download_button(
+                "下载高清海报", data=direct_poster, file_name="xiaohongshu-poster.png",
+                mime="image/png", icon=":material/download:", type="primary", width="stretch",
+                on_click="ignore",
+            )
 
     regenerate_clicked = False
     if st.session_state.get("generation_result") is not None:
@@ -1049,6 +1150,7 @@ def render_generation_page() -> None:
             st.session_state["generation_batch"] = 1
             st.session_state["selected_suggestion"] = None
             st.session_state["cover_previews"] = {}
+            st.session_state["cover_preview_paths"] = {}
             st.session_state["generation_input"] = {
                 "image_bytes": uploaded_photo.getvalue(),
                 "mime_type": uploaded_photo.type or "image/jpeg",
@@ -1115,6 +1217,7 @@ def render_generation_page() -> None:
                 st.session_state["generation_batch"] = next_batch
                 st.session_state["selected_suggestion"] = None
                 st.session_state["cover_previews"] = {}
+                st.session_state["cover_preview_paths"] = {}
                 st.rerun()
             except ValidationError as exc:
                 st.error(f"AI 返回的生成建议未通过 JSON 校验：{exc}")
